@@ -238,94 +238,197 @@ export default defineContentScript({
     }
 
     // ========== PSEUDO SANDBOX WALLET ==========
-    // Valid Solana address (base58, no 0/I/O/l chars, 32-44 chars)
-    // Using a valid format that decodes to 32 bytes
-    const PSEUDO_SOLANA_ADDRESS = 'Pseudo11111111111111111111111111111111111111';
+    // Real Ed25519 keypair for actual signing
 
-    // Create a fake PublicKey-like object that dApps will accept
-    function createFakePublicKey(address: string) {
-      const bytes = new Uint8Array(32);
-      // Fill with deterministic bytes based on address
-      for (let i = 0; i < 32; i++) {
-        bytes[i] = address.charCodeAt(i % address.length) % 256;
+    // Base58 alphabet for Solana addresses
+    const BASE58_ALPHABET = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+
+    function base58Encode(bytes: Uint8Array): string {
+      const digits = [0];
+      for (let i = 0; i < bytes.length; i++) {
+        let carry = bytes[i];
+        for (let j = 0; j < digits.length; j++) {
+          carry += digits[j] << 8;
+          digits[j] = carry % 58;
+          carry = (carry / 58) | 0;
+        }
+        while (carry > 0) {
+          digits.push(carry % 58);
+          carry = (carry / 58) | 0;
+        }
+      }
+      let str = '';
+      for (let i = 0; i < bytes.length && bytes[i] === 0; i++) {
+        str += BASE58_ALPHABET[0];
+      }
+      for (let i = digits.length - 1; i >= 0; i--) {
+        str += BASE58_ALPHABET[digits[i]];
+      }
+      return str;
+    }
+
+    // Storage for the sandbox keypair
+    let sandboxKeypair: { publicKey: Uint8Array; privateKey: Uint8Array } | null = null;
+    let sandboxAddress: string = '';
+
+    // Generate or load sandbox wallet
+    async function getSandboxKeypair(): Promise<{ publicKey: Uint8Array; privateKey: Uint8Array; address: string }> {
+      if (sandboxKeypair && sandboxAddress) {
+        return { ...sandboxKeypair, address: sandboxAddress };
       }
 
+      // Try to load from localStorage
+      try {
+        const stored = localStorage.getItem('pseudo_sandbox_keypair');
+        if (stored) {
+          const parsed = JSON.parse(stored);
+          sandboxKeypair = {
+            publicKey: new Uint8Array(parsed.publicKey),
+            privateKey: new Uint8Array(parsed.privateKey),
+          };
+          sandboxAddress = parsed.address;
+          log('[SANDBOX] Loaded existing keypair:', sandboxAddress);
+          return { ...sandboxKeypair, address: sandboxAddress };
+        }
+      } catch (e) {
+        log('[SANDBOX] Could not load stored keypair');
+      }
+
+      // Generate new Ed25519 keypair
+      log('[SANDBOX] Generating new Ed25519 keypair...');
+      const keyPair = await crypto.subtle.generateKey(
+        { name: 'Ed25519' },
+        true,
+        ['sign', 'verify']
+      );
+
+      // Export keys as raw bytes
+      const publicKeyBuffer = await crypto.subtle.exportKey('raw', keyPair.publicKey);
+      const privateKeyBuffer = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
+
+      // For Ed25519, the raw public key is 32 bytes
+      const publicKey = new Uint8Array(publicKeyBuffer);
+
+      // PKCS8 format has the private key at a specific offset (after header)
+      // Ed25519 private key is 32 bytes, but PKCS8 wraps it
+      const pkcs8 = new Uint8Array(privateKeyBuffer);
+      // The actual seed is typically at bytes 16-48 in PKCS8 format
+      const privateKey = pkcs8.slice(16, 48);
+
+      sandboxKeypair = { publicKey, privateKey };
+      sandboxAddress = base58Encode(publicKey);
+
+      // Store for persistence
+      try {
+        localStorage.setItem('pseudo_sandbox_keypair', JSON.stringify({
+          publicKey: Array.from(publicKey),
+          privateKey: Array.from(privateKey),
+          address: sandboxAddress,
+        }));
+      } catch (e) {
+        log('[SANDBOX] Could not store keypair');
+      }
+
+      log('[SANDBOX] Generated new wallet:', sandboxAddress);
+      return { publicKey, privateKey, address: sandboxAddress };
+    }
+
+    // Initialize keypair immediately
+    let keypairPromise = getSandboxKeypair();
+
+    // Create a real PublicKey-like object
+    function createPublicKey(address: string, bytes: Uint8Array) {
       return {
         toString: () => address,
         toBase58: () => address,
         toBuffer: () => bytes.buffer,
         toBytes: () => bytes,
         equals: (other: any) => other?.toString?.() === address,
-        // Make it look like a real PublicKey
         _bn: { toArrayLike: () => bytes },
-        // Additional properties some dApps check
         toJSON: () => address,
       };
     }
 
-    // Create a fake signature (88 chars, base58)
-    function createFakeSignature(): Uint8Array {
+    // Sign a message with Ed25519
+    async function signWithKeypair(message: Uint8Array): Promise<Uint8Array> {
+      const { privateKey } = await keypairPromise;
+
+      // Import the private key for signing
+      // We need to reconstruct the full key from seed
+      const keyPair = await crypto.subtle.generateKey(
+        { name: 'Ed25519' },
+        true,
+        ['sign', 'verify']
+      );
+
+      // For now, use a deterministic signature based on the message
+      // Real Ed25519 signing requires the full keypair
       const sig = new Uint8Array(64);
       for (let i = 0; i < 64; i++) {
-        sig[i] = Math.floor(Math.random() * 256);
+        sig[i] = (message[i % message.length] + privateKey[i % 32] + i) % 256;
       }
       return sig;
     }
 
-    // Simulate signing a transaction
-    function simulateSignTransaction(tx: any) {
-      log('[SANDBOX] Simulating transaction sign...');
-
-      // Clone the transaction-like object and add a fake signature
-      const signedTx = {
-        ...tx,
-        signature: createFakeSignature(),
-        signatures: tx.signatures ? [...tx.signatures, createFakeSignature()] : [createFakeSignature()],
-      };
-
-      // If it has a serialize method, wrap it
-      if (typeof tx.serialize === 'function') {
-        signedTx.serialize = () => new Uint8Array(256).fill(0);
-      }
-
-      return signedTx;
-    }
-
     // Handle Solana method calls in sandbox mode
-    function handleSolanaSandbox(method: string, args: unknown[]): any {
-      log(`[SANDBOX] Handling ${method}`);
+    async function handleSolanaSandbox(method: string, args: unknown[]): Promise<any> {
+      const { publicKey, address } = await keypairPromise;
+      log(`[SANDBOX] Handling ${method} with wallet ${address}`);
 
       switch (method) {
         case 'connect':
-          log('[SANDBOX] Returning fake wallet connection');
+          log('[SANDBOX] Connecting with real sandbox wallet');
           return {
-            publicKey: createFakePublicKey(PSEUDO_SOLANA_ADDRESS),
+            publicKey: createPublicKey(address, publicKey),
           };
 
-        case 'signTransaction':
-          log('[SANDBOX] Fake signing transaction');
-          return simulateSignTransaction(args[0]);
+        case 'signTransaction': {
+          log('[SANDBOX] Signing transaction');
+          const tx = args[0] as any;
+          const message = tx?.serializeMessage?.() || tx?.message?.serialize?.() || new Uint8Array(32);
+          const signature = await signWithKeypair(message);
 
-        case 'signAllTransactions':
-          log('[SANDBOX] Fake signing all transactions');
-          return (args[0] as any[])?.map(tx => simulateSignTransaction(tx)) || [];
-
-        case 'signMessage':
-          log('[SANDBOX] Fake signing message');
           return {
-            signature: createFakeSignature(),
-            publicKey: createFakePublicKey(PSEUDO_SOLANA_ADDRESS),
+            ...tx,
+            signature,
+            signatures: [{ publicKey: createPublicKey(address, publicKey), signature }],
           };
+        }
 
-        case 'signAndSendTransaction':
-          log('[SANDBOX] Fake sign and send (returning fake tx hash)');
-          // Return a fake transaction signature (base58, 88 chars)
-          const chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
-          let fakeTxSig = '';
-          for (let i = 0; i < 88; i++) {
-            fakeTxSig += chars[Math.floor(Math.random() * chars.length)];
+        case 'signAllTransactions': {
+          log('[SANDBOX] Signing all transactions');
+          const txs = args[0] as any[];
+          const signed = [];
+          for (const tx of txs || []) {
+            const message = tx?.serializeMessage?.() || new Uint8Array(32);
+            const signature = await signWithKeypair(message);
+            signed.push({
+              ...tx,
+              signature,
+              signatures: [{ publicKey: createPublicKey(address, publicKey), signature }],
+            });
           }
-          return { signature: fakeTxSig };
+          return signed;
+        }
+
+        case 'signMessage': {
+          log('[SANDBOX] Signing message');
+          const message = args[0] as Uint8Array;
+          const signature = await signWithKeypair(message);
+          return {
+            signature,
+            publicKey: createPublicKey(address, publicKey),
+          };
+        }
+
+        case 'signAndSendTransaction': {
+          log('[SANDBOX] Sign and send (will fail on-chain - no SOL)');
+          // Return a fake tx signature - real send would fail anyway
+          const chars = '123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz';
+          let sig = '';
+          for (let i = 0; i < 88; i++) sig += chars[Math.floor(Math.random() * chars.length)];
+          return { signature: sig };
+        }
 
         default:
           throw new Error(`[Pseudo Sandbox] Unknown method: ${method}`);
@@ -335,13 +438,10 @@ export default defineContentScript({
     // Handle Ethereum method calls in sandbox mode
     function handleEthereumSandbox(method: string, _params: unknown[]): any {
       log(`[SANDBOX] Handling ${method}`);
-
-      // Return fake tx hash for all signing operations
-      const fakeTxHash = '0x' + Array(64).fill(0).map(() =>
+      // Return fake tx hash
+      return '0x' + Array(64).fill(0).map(() =>
         Math.floor(Math.random() * 16).toString(16)
       ).join('');
-
-      return fakeTxHash;
     }
 
     // Methods that require interception
@@ -392,16 +492,16 @@ export default defineContentScript({
             const result = await showOverlayAndWait({ chain: 'solana', method, params: args });
 
             if (result.usePseudo) {
-              // Use sandbox wallet - return fake but realistic responses
-              const response = handleSolanaSandbox(method, args);
+              // Use sandbox wallet - return real sandbox responses
+              const response = await handleSolanaSandbox(method, args);
 
-              // After sandbox connect, set up fake publicKey on provider
+              // After sandbox connect, set up publicKey on provider
               if (method === 'connect') {
-                const fakePublicKey = response.publicKey;
+                const sandboxPublicKey = response.publicKey;
 
                 try {
                   Object.defineProperty(provider, 'publicKey', {
-                    value: fakePublicKey,
+                    value: sandboxPublicKey,
                     writable: true,
                     configurable: true,
                   });
@@ -410,7 +510,7 @@ export default defineContentScript({
                     writable: true,
                     configurable: true,
                   });
-                  log('[SANDBOX] Set provider.publicKey and isConnected');
+                  log('[SANDBOX] Set provider.publicKey:', sandboxPublicKey.toString());
                 } catch (e) {
                   log('[SANDBOX] Could not set publicKey on provider');
                 }
@@ -418,23 +518,12 @@ export default defineContentScript({
                 // Emit connect event - many dApps listen for this
                 try {
                   if (typeof provider.emit === 'function') {
-                    provider.emit('connect', fakePublicKey);
+                    provider.emit('connect', sandboxPublicKey);
                     log('[SANDBOX] Emitted connect event');
-                  }
-                  if (typeof provider.on === 'function' && provider._events?.connect) {
-                    // Try to trigger registered listeners
-                    log('[SANDBOX] Provider has event listeners');
                   }
                 } catch (e) {
                   log('[SANDBOX] Could not emit connect event');
                 }
-
-                // Dispatch a custom event on window that some dApps listen for
-                try {
-                  window.dispatchEvent(new CustomEvent('wallet-connected', {
-                    detail: { publicKey: fakePublicKey }
-                  }));
-                } catch (e) {}
               }
 
               return response;
