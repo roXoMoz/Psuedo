@@ -1,0 +1,15 @@
+{
+  "name": "pseudo",
+  "version": "0.1.0",
+  "description": "A fake wallet that shows you the real danger",
+  "type": "module",
+  "scripts": {
+    "dev": "wxt",
+    "build": "wxt build",
+    "zip": "wxt zip"
+  },
+  "devDependencies": {
+    "typescript": "^5.9.3",
+    "wxt": "^0.20.13"
+  }
+}
