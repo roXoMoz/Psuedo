@@ -268,30 +268,41 @@ export default defineContentScript({
     }
 
     // Storage for the sandbox keypair
-    let sandboxKeypair: { publicKey: Uint8Array; privateKey: Uint8Array } | null = null;
+    let sandboxPublicKey: Uint8Array | null = null;
+    let sandboxPrivateKey: CryptoKey | null = null;
     let sandboxAddress: string = '';
 
     // Generate or load sandbox wallet
-    async function getSandboxKeypair(): Promise<{ publicKey: Uint8Array; privateKey: Uint8Array; address: string }> {
-      if (sandboxKeypair && sandboxAddress) {
-        return { ...sandboxKeypair, address: sandboxAddress };
+    async function getSandboxKeypair(): Promise<{ publicKey: Uint8Array; privateKey: CryptoKey; address: string }> {
+      if (sandboxPublicKey && sandboxPrivateKey && sandboxAddress) {
+        return { publicKey: sandboxPublicKey, privateKey: sandboxPrivateKey, address: sandboxAddress };
       }
 
       // Try to load from localStorage
       try {
-        const stored = localStorage.getItem('pseudo_sandbox_keypair');
+        const stored = localStorage.getItem('pseudo_sandbox_keypair_v2');
         if (stored) {
           const parsed = JSON.parse(stored);
-          sandboxKeypair = {
-            publicKey: new Uint8Array(parsed.publicKey),
-            privateKey: new Uint8Array(parsed.privateKey),
-          };
+          const publicKey = new Uint8Array(parsed.publicKey);
+          const pkcs8 = new Uint8Array(parsed.pkcs8);
+
+          // Import the private key
+          const privateKey = await crypto.subtle.importKey(
+            'pkcs8',
+            pkcs8,
+            { name: 'Ed25519' },
+            false,
+            ['sign']
+          );
+
+          sandboxPublicKey = publicKey;
+          sandboxPrivateKey = privateKey;
           sandboxAddress = parsed.address;
           log('[SANDBOX] Loaded existing keypair:', sandboxAddress);
-          return { ...sandboxKeypair, address: sandboxAddress };
+          return { publicKey, privateKey, address: sandboxAddress };
         }
       } catch (e) {
-        log('[SANDBOX] Could not load stored keypair');
+        log('[SANDBOX] Could not load stored keypair:', e);
       }
 
       // Generate new Ed25519 keypair
@@ -302,27 +313,22 @@ export default defineContentScript({
         ['sign', 'verify']
       );
 
-      // Export keys as raw bytes
+      // Export keys
       const publicKeyBuffer = await crypto.subtle.exportKey('raw', keyPair.publicKey);
-      const privateKeyBuffer = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
+      const pkcs8Buffer = await crypto.subtle.exportKey('pkcs8', keyPair.privateKey);
 
-      // For Ed25519, the raw public key is 32 bytes
       const publicKey = new Uint8Array(publicKeyBuffer);
+      const pkcs8 = new Uint8Array(pkcs8Buffer);
 
-      // PKCS8 format has the private key at a specific offset (after header)
-      // Ed25519 private key is 32 bytes, but PKCS8 wraps it
-      const pkcs8 = new Uint8Array(privateKeyBuffer);
-      // The actual seed is typically at bytes 16-48 in PKCS8 format
-      const privateKey = pkcs8.slice(16, 48);
-
-      sandboxKeypair = { publicKey, privateKey };
+      sandboxPublicKey = publicKey;
+      sandboxPrivateKey = keyPair.privateKey;
       sandboxAddress = base58Encode(publicKey);
 
       // Store for persistence
       try {
-        localStorage.setItem('pseudo_sandbox_keypair', JSON.stringify({
+        localStorage.setItem('pseudo_sandbox_keypair_v2', JSON.stringify({
           publicKey: Array.from(publicKey),
-          privateKey: Array.from(privateKey),
+          pkcs8: Array.from(pkcs8),
           address: sandboxAddress,
         }));
       } catch (e) {
@@ -330,7 +336,7 @@ export default defineContentScript({
       }
 
       log('[SANDBOX] Generated new wallet:', sandboxAddress);
-      return { publicKey, privateKey, address: sandboxAddress };
+      return { publicKey, privateKey: keyPair.privateKey, address: sandboxAddress };
     }
 
     // Initialize keypair immediately
@@ -349,25 +355,18 @@ export default defineContentScript({
       };
     }
 
-    // Sign a message with Ed25519
+    // Sign a message with Ed25519 using real crypto
     async function signWithKeypair(message: Uint8Array): Promise<Uint8Array> {
       const { privateKey } = await keypairPromise;
 
-      // Import the private key for signing
-      // We need to reconstruct the full key from seed
-      const keyPair = await crypto.subtle.generateKey(
+      // Actually sign with Ed25519
+      const signatureBuffer = await crypto.subtle.sign(
         { name: 'Ed25519' },
-        true,
-        ['sign', 'verify']
+        privateKey,
+        message
       );
 
-      // For now, use a deterministic signature based on the message
-      // Real Ed25519 signing requires the full keypair
-      const sig = new Uint8Array(64);
-      for (let i = 0; i < 64; i++) {
-        sig[i] = (message[i % message.length] + privateKey[i % 32] + i) % 256;
-      }
-      return sig;
+      return new Uint8Array(signatureBuffer);
     }
 
     // Handle Solana method calls in sandbox mode
