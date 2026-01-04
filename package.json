@@ -11,5 +11,9 @@
   "devDependencies": {
     "typescript": "^5.9.3",
     "wxt": "^0.20.13"
+  },
+  "dependencies": {
+    "@noble/hashes": "^2.0.1",
+    "@noble/secp256k1": "^3.0.0"
   }
 }
